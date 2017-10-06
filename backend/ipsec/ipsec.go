@@ -227,12 +227,16 @@ func (o *Overlay) configure() error {
 	if err != nil {
 		firstErr = handleErr(firstErr, err, "Failed to list rules for: %v", err)
 	}
+	log.Debugf("existingPolicies: %v", existingPolicies)
 
 	if err := o.loadSharedKey(""); err != nil {
 		firstErr = handleErr(firstErr, err, "Failed to load key for %any: %v", err)
 	}
 
-	for _, entry := range o.db.Entries() {
+	entries := o.db.Entries()
+	log.Debugf("entries: %v", entries)
+
+	for _, entry := range entries {
 		if entry.Peer {
 			if err := o.loadSharedKey(entry.IPAddress); err != nil {
 				firstErr = handleErr(firstErr, err, "Failed to set PSK for peer agent %s: %v", entry.IPAddress, err)
@@ -256,10 +260,12 @@ func (o *Overlay) configure() error {
 	}
 
 	if firstErr == nil {
+		log.Debugf("policies to be deleted: %v", existingPolicies)
 		firstErr = o.deletePolicies(existingPolicies)
 	}
 
 	if firstErr == nil {
+		log.Debugf("policiesToAdd: %v", policiesToAdd)
 		firstErr = o.addPolicies(policiesToAdd)
 	}
 

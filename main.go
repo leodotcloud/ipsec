@@ -118,7 +118,7 @@ func appMain(ctx *cli.Context) error {
 	overlay.Start(ctx.GlobalBool("charon-launch"), ctx.GlobalString("charon-log"))
 
 	go func() {
-		done <- arp.ListenAndServe(db, "eth0")
+		done <- arp.ListenAndServe(db, "docker0")
 	}()
 
 	listenPort := ctx.GlobalString("listen")

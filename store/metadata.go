@@ -32,9 +32,7 @@ type MetadataStore struct {
 // InfoFromMetadata stores the information that has been fetched from
 // metadata server
 type InfoFromMetadata struct {
-	selfContainer           metadata.Container
 	selfHost                metadata.Host
-	selfService             metadata.Service
 	selfNetwork             metadata.Network
 	selfNetworkSubnetPrefix string
 	services                []metadata.Service
@@ -120,10 +118,50 @@ func (ms *MetadataStore) Entries() []Entry {
 	return ms.entries
 }
 
-func (ms *MetadataStore) getEntryFromContainer(c metadata.Container) (Entry, error) {
+func (ms *MetadataStore) buildPeersMap() map[string]Entry {
+	peersMap := make(map[string]Entry)
 
-	isSelf := (c.PrimaryIp == ms.info.selfContainer.PrimaryIp)
+	for _, h := range ms.info.hosts {
+		isSelf := h.UUID == ms.info.selfHost.UUID
+		e := Entry{
+			h.AgentIP + "/32",
+			h.AgentIP,
+			isSelf,
+			true,
+		}
+		peersMap[h.AgentIP] = e
+	}
+
+	return peersMap
+}
+
+func (ms *MetadataStore) getEntryFromHost(h metadata.Host) (Entry, error) {
+	isSelf := h.UUID == ms.info.selfHost.UUID
+
+	entry := Entry{
+		h.AgentIP + "/32",
+		h.AgentIP,
+		isSelf,
+		true,
+	}
+
+	return entry, nil
+}
+
+func getSelfNetwork(networks []metadata.Network) metadata.Network {
+	var selfNetwork metadata.Network
+	for _, n := range networks {
+		if n.Name == "ipsec" {
+			selfNetwork = n
+			break
+		}
+	}
+	return selfNetwork
+}
+
+func (ms *MetadataStore) getEntryFromContainer(c metadata.Container) (Entry, error) {
 	isPeer := false
+	isSelf := false
 
 	entry := Entry{
 		c.PrimaryIp + ms.info.selfNetworkSubnetPrefix,
@@ -175,7 +213,7 @@ func getNetworksMapFromNetworksArray(networks []metadata.Network) map[string]met
 }
 
 func (ms *MetadataStore) getLinkedFromServicesToSelf() []*metadata.Service {
-	linkedTo := ms.info.selfService.StackName + "/" + ms.info.selfService.Name
+	linkedTo := "ipsec/ipsec"
 	log.Debugf("getLinkedFromServicesToSelf linkedTo: %v", linkedTo)
 
 	var linkedFromServices []*metadata.Service
@@ -207,8 +245,10 @@ func (ms *MetadataStore) getLinkedPeersInfo() (map[string]bool, []metadata.Conta
 	var linkedPeersContainers []metadata.Container
 
 	// Find out if the current service has links else if other services link to current service
-	if len(ms.info.selfService.Links) > 0 {
-		for linkedServiceName := range ms.info.selfService.Links {
+	curServicePtr := ms.info.servicesMapByName["ipsec/ipsec"]
+	curService := *curServicePtr[0]
+	if len(curService.Links) > 0 {
+		for linkedServiceName := range curService.Links {
 			linkedServices, ok := ms.info.servicesMapByName[linkedServiceName]
 			log.Debugf("linkedServices: %+v", linkedServices)
 			if !ok {
@@ -259,45 +299,32 @@ func (ms *MetadataStore) getLinkedPeersInfo() (map[string]bool, []metadata.Conta
 func (ms *MetadataStore) doInternalRefresh() {
 	log.Debugf("Doing internal refresh")
 
-	ms.self, _ = ms.getEntryFromContainer(ms.info.selfContainer)
+	ms.self, _ = ms.getEntryFromHost(ms.info.selfHost)
 
 	seen := map[string]bool{}
 	entries := []Entry{}
 	local := map[string]Entry{}
 	remote := map[string]Entry{}
-	peersMap := map[string]Entry{}
 	remoteNonPeersMap := map[string]Entry{}
-	peersNetworks, linkedPeersContainers := ms.getLinkedPeersInfo()
+	//peersNetworks, linkedPeersContainers := ms.getLinkedPeersInfo()
 
-	// Add self network to peersNetworks
-	peersNetworks[ms.info.selfContainer.NetworkUUID] = true
-
-	var allPeersContainers []metadata.Container
-	allPeersContainers = append(allPeersContainers, linkedPeersContainers...)
-	for _, c := range ms.info.selfService.Containers {
-		if c.State == "running" || c.State == "starting" {
-			allPeersContainers = append(allPeersContainers, c)
-		}
-	}
-
-	for _, sc := range allPeersContainers {
-		e, _ := ms.getEntryFromContainer(sc)
-		e.Peer = true
-		ipNoCidr := strings.Split(e.IPAddress, "/")[0]
-		peersMap[ipNoCidr] = e
-	}
+	peersMap := ms.buildPeersMap()
 
 	for _, c := range ms.info.containers {
 		if !(c.State == "running" || c.State == "starting") {
 			continue
 		}
 
+		// TODO:
 		// check if the container networkUUID is part of peersNetworks
-		_, isPresentInPeersNetworks := peersNetworks[c.NetworkUUID]
+		//_, isPresentInPeersNetworks := peersNetworks[c.NetworkUUID]
 
-		if !isPresentInPeersNetworks ||
-			c.PrimaryIp == "" ||
-			c.NetworkFromContainerUUID != "" {
+		//if !isPresentInPeersNetworks ||
+		if c.PrimaryIp == "" ||
+			c.NetworkFromContainerUUID != "" ||
+			c.NetworkUUID != ms.info.selfNetwork.UUID ||
+			c.PrimaryIp == ms.info.selfHost.AgentIP ||
+			c.PrimaryIp == ms.info.hostsMap[c.HostUUID].AgentIP {
 			continue
 		}
 
@@ -310,10 +337,6 @@ func (ms *MetadataStore) doInternalRefresh() {
 			continue
 		}
 		seen[ipNoCidr] = true
-
-		if _, ok := peersMap[ipNoCidr]; ok {
-			e.Peer = true
-		}
 
 		if e.HostIPAddress == ms.self.HostIPAddress {
 			local[ipNoCidr] = e
@@ -342,14 +365,14 @@ func (ms *MetadataStore) doInternalRefresh() {
 
 // getServicesMapByName builds a map indexed by `stack_name/service_name`
 // It excludes the current service in the map
-func getServicesMapByName(services []metadata.Service, selfService metadata.Service) map[string][]*metadata.Service {
+func getServicesMapByName(services []metadata.Service) map[string][]*metadata.Service {
 	// Build serviceMap by "stack_name/service_name"
 	// The reason for an array in map value is because of not
 	// using UUID but names which can result in duplicates.
 	// TODO: Once LinksByUUID is available, use that instead
 	servicesMapByName := make(map[string][]*metadata.Service)
 	for index, aService := range services {
-		if !aService.System || aService.UUID == selfService.UUID {
+		if !aService.System {
 			continue
 		}
 		key := aService.StackName + "/" + aService.Name
@@ -389,12 +412,6 @@ func getSubnetPrefixFromNetworkConfig(network metadata.Network) string {
 func (ms *MetadataStore) Reload() error {
 	log.Debugf("Reloading ...")
 
-	selfContainer, err := ms.mc.GetSelfContainer()
-	if err != nil {
-		log.Errorf("couldn't get self container from metadata: %v", err)
-		return err
-	}
-
 	selfHost, err := ms.mc.GetSelfHost()
 	if err != nil {
 		log.Errorf("couldn't get self host from metadata: %v", err)
@@ -413,19 +430,13 @@ func (ms *MetadataStore) Reload() error {
 		return err
 	}
 
-	selfService, err := ms.mc.GetSelfService()
-	if err != nil {
-		log.Errorf("couldn't get self service from metadata: %v", err)
-		return err
-	}
-
 	services, err := ms.mc.GetServices()
 	if err != nil {
 		log.Errorf("couldn't get services from metadata: %v", err)
 		return err
 	}
 
-	servicesMapByName := getServicesMapByName(services, selfService)
+	servicesMapByName := getServicesMapByName(services)
 
 	hostsMap := getHostsMapFromHostsArray(hosts)
 
@@ -436,17 +447,12 @@ func (ms *MetadataStore) Reload() error {
 	}
 	networksMap := getNetworksMapFromNetworksArray(networks)
 
-	selfNetwork, ok := networksMap[selfContainer.NetworkUUID]
-	if !ok {
-		return fmt.Errorf("couldn't find self network in metadata")
-	}
+	selfNetwork := getSelfNetwork(networks)
 
 	selfNetworkSubnetPrefix := getSubnetPrefixFromNetworkConfig(selfNetwork)
 
 	info := &InfoFromMetadata{
-		selfContainer,
 		selfHost,
-		selfService,
 		selfNetwork,
 		selfNetworkSubnetPrefix,
 		services,
